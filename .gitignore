@@ -1,3 +1,4 @@
+.uv-cache/
 data/tokenizers
 __pycache__/
 .DS_Store
@@ -6,6 +7,7 @@ modded-nanogpt
 data/datasets
 data/manifest.json
 data/docs_selected.jsonl
+data/docs_selected.source_manifest.json
 .mypy_cache/
 .venv
 logs/

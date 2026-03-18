@@ -1,0 +1,23 @@
+[project]
+name = "parameter-golf"
+version = "0.0.0"
+description = "Local experimentation environment for the Parameter Golf challenge"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "datasets",
+    "huggingface-hub",
+    "mlx; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "numpy",
+    "sentencepiece",
+    "tiktoken",
+    "tqdm",
+    "typing-extensions==4.15.0",
+]
+
+[dependency-groups]
+torch = [
+    "torch==2.10",
+]
+
+[tool.uv]
+package = false
