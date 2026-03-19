@@ -52,6 +52,7 @@ class Hyperparameters:
     val_loss_every: int = int(os.environ.get("VAL_LOSS_EVERY", 0))
     # Validation always uses the full fineweb_val split.
     val_batch_size: int = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_max_tokens: int = int(os.environ.get("VAL_MAX_TOKENS", 0))
     train_log_every: int = int(os.environ.get("TRAIN_LOG_EVERY", 200))
     train_batch_tokens: int = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     grad_accum_steps: int = int(os.environ.get("GRAD_ACCUM_STEPS", 8))
@@ -66,11 +67,14 @@ class Hyperparameters:
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
+    depth_repeats: int = int(os.environ.get("DEPTH_REPEATS", 1))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
-    mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult: float = float(os.environ.get("MLP_MULT", 2.0))
+    share_mlp: bool = bool(int(os.environ.get("SHARE_MLP", "0")))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    use_skip_stack: bool = bool(int(os.environ.get("USE_SKIP_STACK", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -120,7 +124,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,layer_emb",
     ).split(",")
     if pattern
 )
@@ -336,9 +340,9 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # Baseline MLP uses relu^2 instead of GELU/SiLU. It is cheap and works well in this setup.
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: float):
         super().__init__()
-        hidden = dim * mlp_mult
+        hidden = max(1, int(round(dim * mlp_mult)))
         self.fc = CastedLinear(dim, hidden)
         self.proj = CastedLinear(hidden, dim)
 
@@ -353,56 +357,92 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: int,
+        mlp_mult: float,
         rope_base: float,
         qk_gain_init: float,
+        use_local_mlp: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult) if use_local_mlp else None
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, x0: mx.array, shared_mlp: MLP | None = None) -> mx.array:
         mix = self.resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp = self.mlp if self.mlp is not None else shared_mlp
+        if mlp is None:
+            raise RuntimeError("block requires either a local MLP or shared_mlp")
+        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * mlp(self.mlp_norm(x))
         return x
 
 
 class GPT(nn.Module):
     # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
+    # - either baseline skip-stack execution or repeated full-stack execution
+    # - optional shared MLP across physical blocks
     # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        depth_repeats: int,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: int,
+        mlp_mult: float,
+        share_mlp: bool,
+        use_skip_stack: bool,
+        logit_chunk_tokens: int,
+        logit_softcap: float,
+        rope_base: float,
+        tied_embed_init_std: float,
+        qk_gain_init: float,
+    ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {num_layers}")
+        if depth_repeats <= 0:
+            raise ValueError(f"depth_repeats must be positive, got {depth_repeats}")
+        if use_skip_stack and depth_repeats != 1:
+            raise ValueError("DEPTH_REPEATS>1 requires USE_SKIP_STACK=0 to repeat the full layer stack")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.depth_repeats = depth_repeats
+        self.share_mlp = share_mlp
+        self.use_skip_stack = use_skip_stack
+        self.logical_layers = num_layers * depth_repeats
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_encoder_layers = num_layers // 2 if use_skip_stack else 0
+        self.num_decoder_layers = num_layers - self.num_encoder_layers if use_skip_stack else 0
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        if not self.use_skip_stack and self.depth_repeats > 1:
+            self.layer_emb = mx.random.normal((self.logical_layers, dim), dtype=mx.float32) * 0.02
+        else:
+            self.layer_emb = None
+        self.shared_mlp = MLP(dim, mlp_mult) if share_mlp else None
         self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_local_mlp=not share_mlp)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
             b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+            if b.mlp is not None:
+                b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        if self.shared_mlp is not None:
+            self.shared_mlp.proj.weight = mx.zeros_like(self.shared_mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -411,21 +451,37 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
+    def _run_block(self, block: Block, x: mx.array, x0: mx.array) -> mx.array:
+        return block(x, x0, shared_mlp=self.shared_mlp)
+
+    def _forward_skip_stack(self, x: mx.array, x0: mx.array) -> mx.array:
+        skips: list[mx.array] = []
+        for i in range(self.num_encoder_layers):
+            x = self._run_block(self.blocks[i], x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+            x = self._run_block(self.blocks[self.num_encoder_layers + i], x, x0)
+        return x
+
+    def _forward_repeated_stack(self, x: mx.array, x0: mx.array) -> mx.array:
+        layer_idx = 0
+        for _ in range(self.depth_repeats):
+            for block in self.blocks:
+                if self.layer_emb is not None:
+                    x = x + self.layer_emb[layer_idx].astype(x.dtype)[None, None, :]
+                x = self._run_block(block, x, x0)
+                layer_idx += 1
+        return x
+
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
-        skips: list[mx.array] = []
-
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        if self.use_skip_stack:
+            x = self._forward_skip_stack(x, x0)
+        else:
+            x = self._forward_repeated_stack(x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -490,12 +546,18 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if (k.startswith("blocks.") or k.startswith("shared_mlp."))
+            and p.ndim == 2
+            and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k in {"skip_weights", "layer_emb"}
+            or (
+                (k.startswith("blocks.") or k.startswith("shared_mlp."))
+                and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+            )
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -722,13 +784,18 @@ def validate_dataset_tokenizer_pair(data_path: str, tokenizer_path: str) -> tupl
     return dataset_dir.name, actual_train_files, expected_train_files
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> np.ndarray:
+def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> np.ndarray:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = np.ascontiguousarray(np.concatenate([load_data_shard(file) for file in files], axis=0))
     usable = ((tokens.size - 1) // seq_len) * seq_len
+    if max_tokens > 0:
+        max_usable = (max_tokens // seq_len) * seq_len
+        if max_usable <= 0:
+            raise ValueError(f"VAL_MAX_TOKENS={max_tokens} is too small for TRAIN_SEQ_LEN={seq_len}")
+        usable = min(usable, max_usable)
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
@@ -857,7 +924,7 @@ def main() -> None:
         args.data_path,
         args.tokenizer_path,
     )
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
 
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size
@@ -876,10 +943,13 @@ def main() -> None:
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        depth_repeats=args.depth_repeats,
         dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        share_mlp=args.share_mlp,
+        use_skip_stack=args.use_skip_stack,
         logit_chunk_tokens=args.logit_chunk_tokens,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
@@ -923,6 +993,11 @@ def main() -> None:
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
+    )
+    log(
+        f"model_shape:physical_layers:{args.num_layers} logical_layers:{model.logical_layers} "
+        f"depth_repeats:{args.depth_repeats} share_mlp:{args.share_mlp} "
+        f"use_skip_stack:{args.use_skip_stack} mlp_mult:{args.mlp_mult:g}"
     )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
