@@ -1,7 +1,7 @@
 """
 The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
 
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
+Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 lines.
 """
 
 from __future__ import annotations
@@ -30,11 +30,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-# Default Simple Baseline run:
+# Default Training Opt Seq4096 v1 run:
 # - 9 transformer blocks at width 512
 # - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
+# - vocab size 1024, sequence length 4096, tied embeddings
+# - 393,216 train tokens per step (3/4 batch) for 20,000 iterations with a ~10 minute cap
+# - tuned Muon optimizer: momentum 0.99, lower LR (0.020/0.020/0.030), warmdown 3000
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
@@ -42,49 +43,45 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
-    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    run_id = os.environ.get("RUN_ID", "training_opt_seq4096_v1")
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
-    val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", 0))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
-    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 393_216))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 4096))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
-    depth_repeats = int(os.environ.get("DEPTH_REPEATS", 1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = float(os.environ.get("MLP_MULT", 2.0))
-    share_mlp = bool(int(os.environ.get("SHARE_MLP", "0")))
+    mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
-    use_skip_stack = bool(int(os.environ.get("USE_SKIP_STACK", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.030))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.020))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.020))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
-    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
-    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
+    muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -208,18 +205,13 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> Tensor:
+def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
     usable = ((tokens.numel() - 1) // seq_len) * seq_len
-    if max_tokens > 0:
-        max_usable = (max_tokens // seq_len) * seq_len
-        if max_usable <= 0:
-            raise ValueError(f"VAL_MAX_TOKENS={max_tokens} is too small for TRAIN_SEQ_LEN={seq_len}")
-        usable = min(usable, max_usable)
     if usable <= 0:
         raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
     return tokens[: usable + 1]
@@ -298,7 +290,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,layer_emb",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -614,9 +606,9 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: float):
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
-        hidden = max(1, int(round(mlp_mult * dim)))
+        hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
@@ -632,29 +624,25 @@ class Block(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: float,
+        mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
-        use_local_mlp: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult) if use_local_mlp else None
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, shared_mlp: MLP | None = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        mlp = self.mlp if self.mlp is not None else shared_mlp
-        if mlp is None:
-            raise RuntimeError("block requires either a local MLP or shared_mlp")
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -663,14 +651,11 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
-        depth_repeats: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        mlp_mult: float,
-        share_mlp: bool,
+        mlp_mult: int,
         tie_embeddings: bool,
-        use_skip_stack: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
@@ -679,30 +664,14 @@ class GPT(nn.Module):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
-        if num_layers <= 0:
-            raise ValueError(f"num_layers must be positive, got {num_layers}")
-        if depth_repeats <= 0:
-            raise ValueError(f"depth_repeats must be positive, got {depth_repeats}")
-        if use_skip_stack and depth_repeats != 1:
-            raise ValueError("DEPTH_REPEATS>1 requires USE_SKIP_STACK=0 to repeat the full layer stack")
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.depth_repeats = depth_repeats
-        self.share_mlp = share_mlp
-        self.use_skip_stack = use_skip_stack
-        self.logical_layers = num_layers * depth_repeats
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2 if use_skip_stack else 0
-        self.num_decoder_layers = num_layers - self.num_encoder_layers if use_skip_stack else 0
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        if not self.use_skip_stack and self.depth_repeats > 1:
-            self.layer_emb = nn.Parameter(torch.zeros(self.logical_layers, model_dim, dtype=torch.float32))
-            nn.init.normal_(self.layer_emb, std=0.02)
-        else:
-            self.register_parameter("layer_emb", None)
-        self.shared_mlp = MLP(model_dim, mlp_mult) if share_mlp else None
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -712,7 +681,6 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
-                    use_local_mlp=not share_mlp,
                 )
                 for i in range(num_layers)
             ]
@@ -730,38 +698,20 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _run_block(self, block: Block, x: Tensor, x0: Tensor) -> Tensor:
-        return block(x, x0, shared_mlp=self.shared_mlp)
-
-    def _forward_skip_stack(self, x: Tensor, x0: Tensor) -> Tensor:
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self._run_block(self.blocks[i], x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self._run_block(self.blocks[self.num_encoder_layers + i], x, x0)
-        return x
-
-    def _forward_repeated_stack(self, x: Tensor, x0: Tensor) -> Tensor:
-        layer_idx = 0
-        for _ in range(self.depth_repeats):
-            for block in self.blocks:
-                if self.layer_emb is not None:
-                    x = x + self.layer_emb[layer_idx].to(dtype=x.dtype)[None, None, :]
-                x = self._run_block(block, x, x0)
-                layer_idx += 1
-        return x
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        if self.use_skip_stack:
-            x = self._forward_skip_stack(x, x0)
-        else:
-            x = self._forward_repeated_stack(x, x0)
+        skips: list[Tensor] = []
+
+        # First half stores skips; second half reuses them in reverse order.
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -862,7 +812,7 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -877,14 +827,11 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
-        depth_repeats=args.depth_repeats,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
-        share_mlp=args.share_mlp,
         tie_embeddings=args.tie_embeddings,
-        use_skip_stack=args.use_skip_stack,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
@@ -903,8 +850,6 @@ def main() -> None:
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    if base_model.shared_mlp is not None:
-        block_named_params.extend((f"shared_mlp.{name}", p) for name, p in base_model.shared_mlp.named_parameters())
     matrix_params = [
         p
         for name, p in block_named_params
@@ -917,8 +862,6 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    if base_model.layer_emb is not None:
-        scalar_params.append(base_model.layer_emb)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -952,11 +895,6 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
-    log0(
-        f"model_shape:physical_layers:{args.num_layers} logical_layers:{base_model.logical_layers} "
-        f"depth_repeats:{args.depth_repeats} share_mlp:{args.share_mlp} "
-        f"use_skip_stack:{args.use_skip_stack} mlp_mult:{args.mlp_mult:g}"
-    )
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1187,3 +1125,165 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.12.3 (main, Aug 14 2025, 17:47:21) [GCC 13.3.0]
+Running PyTorch 2.8.0+cu128
+Thu Mar 19 05:03:59 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.211.01             Driver Version: 570.211.01     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:18:00.0 Off |                    0 |
+| N/A   28C    P0            117W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:2A:00.0 Off |                    0 |
+| N/A   30C    P0            117W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:3A:00.0 Off |                    0 |
+| N/A   32C    P0            123W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:5D:00.0 Off |                    0 |
+| N/A   27C    P0            117W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:9A:00.0 Off |                    0 |
+| N/A   26C    P0            114W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:AB:00.0 Off |                    0 |
+| N/A   31C    P0            121W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:BA:00.0 Off |                    0 |
+| N/A   30C    P0            117W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:DB:00.0 Off |                    0 |
+| N/A   26C    P0            119W /  700W |    1519MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|    0   N/A  N/A          202262      C   /usr/local/bin/python                  1510MiB |
+|    1   N/A  N/A          202263      C   /usr/local/bin/python                  1510MiB |
+|    2   N/A  N/A          202264      C   /usr/local/bin/python                  1510MiB |
+|    3   N/A  N/A          202265      C   /usr/local/bin/python                  1510MiB |
+|    4   N/A  N/A          202266      C   /usr/local/bin/python                  1510MiB |
+|    5   N/A  N/A          202267      C   /usr/local/bin/python                  1510MiB |
+|    6   N/A  N/A          202268      C   /usr/local/bin/python                  1510MiB |
+|    7   N/A  N/A          202269      C   /usr/local/bin/python                  1510MiB |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:17059912
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.03 head_lr:0.0 matrix_lr:0.02 scalar_lr:0.02
+train_batch_tokens:393216 train_seq_len:4096 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:1339
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:6.9372 val_bpb:4.1086 train_time:0ms step_avg:0.02ms
+step:1/20000 train_loss:6.9377 train_time:40ms step_avg:40.37ms
+step:2/20000 train_loss:12.1131 train_time:102ms step_avg:50.86ms
+step:3/20000 train_loss:7.3629 train_time:175ms step_avg:58.28ms
+step:4/20000 train_loss:6.3140 train_time:245ms step_avg:61.16ms
+step:5/20000 train_loss:6.8601 train_time:316ms step_avg:63.13ms
+step:6/20000 train_loss:6.9431 train_time:378ms step_avg:62.98ms
+step:7/20000 train_loss:6.7660 train_time:457ms step_avg:65.26ms
+step:8/20000 train_loss:6.4793 train_time:527ms step_avg:65.87ms
+step:9/20000 train_loss:6.3069 train_time:591ms step_avg:65.66ms
+step:10/20000 train_loss:6.2345 train_time:654ms step_avg:65.37ms
+step:200/20000 train_loss:2.7717 train_time:10524ms step_avg:52.62ms
+step:400/20000 train_loss:2.4119 train_time:25089ms step_avg:62.72ms
+step:600/20000 train_loss:2.2870 train_time:39146ms step_avg:65.24ms
+step:800/20000 train_loss:2.3682 train_time:53332ms step_avg:66.67ms
+step:1000/20000 train_loss:2.3258 train_time:63778ms step_avg:63.78ms
+step:1000/20000 val_loss:2.3036 val_bpb:1.3643 train_time:63809ms step_avg:63.81ms
+step:1200/20000 train_loss:2.3500 train_time:79075ms step_avg:65.90ms
+step:1400/20000 train_loss:2.3032 train_time:93065ms step_avg:66.48ms
+step:1600/20000 train_loss:2.2669 train_time:106365ms step_avg:66.48ms
+step:1800/20000 train_loss:2.0491 train_time:119794ms step_avg:66.55ms
+step:2000/20000 train_loss:2.3109 train_time:130239ms step_avg:65.12ms
+step:2000/20000 val_loss:2.2128 val_bpb:1.3106 train_time:130273ms step_avg:65.14ms
+step:2200/20000 train_loss:2.0611 train_time:144178ms step_avg:65.54ms
+step:2400/20000 train_loss:2.2093 train_time:157566ms step_avg:65.65ms
+step:2600/20000 train_loss:2.3236 train_time:170759ms step_avg:65.68ms
+step:2800/20000 train_loss:2.3997 train_time:185694ms step_avg:66.32ms
+step:3000/20000 train_loss:2.1766 train_time:196104ms step_avg:65.37ms
+step:3000/20000 val_loss:2.1566 val_bpb:1.2773 train_time:196141ms step_avg:65.38ms
+step:3200/20000 train_loss:2.1982 train_time:209488ms step_avg:65.46ms
+step:3400/20000 train_loss:2.2025 train_time:225460ms step_avg:66.31ms
+step:3600/20000 train_loss:2.0799 train_time:240943ms step_avg:66.93ms
+step:3800/20000 train_loss:2.0977 train_time:251427ms step_avg:66.16ms
+step:4000/20000 train_loss:1.9322 train_time:266529ms step_avg:66.63ms
+step:4000/20000 val_loss:2.1237 val_bpb:1.2578 train_time:266559ms step_avg:66.64ms
+step:4200/20000 train_loss:2.0105 train_time:281249ms step_avg:66.96ms
+step:4400/20000 train_loss:2.1162 train_time:297764ms step_avg:67.67ms
+step:4600/20000 train_loss:2.0382 train_time:312481ms step_avg:67.93ms
+step:4800/20000 train_loss:2.0747 train_time:322932ms step_avg:67.28ms
+step:5000/20000 train_loss:2.1439 train_time:338935ms step_avg:67.79ms
+step:5000/20000 val_loss:2.1047 val_bpb:1.2465 train_time:338964ms step_avg:67.79ms
+step:5200/20000 train_loss:2.2006 train_time:354715ms step_avg:68.21ms
+step:5400/20000 train_loss:1.9001 train_time:371359ms step_avg:68.77ms
+step:5600/20000 train_loss:2.2526 train_time:386064ms step_avg:68.94ms
+step:5800/20000 train_loss:2.1734 train_time:396507ms step_avg:68.36ms
+step:6000/20000 train_loss:1.9981 train_time:413445ms step_avg:68.91ms
+step:6000/20000 val_loss:2.0865 val_bpb:1.2358 train_time:413479ms step_avg:68.91ms
+step:6200/20000 train_loss:2.1487 train_time:429320ms step_avg:69.25ms
+step:6400/20000 train_loss:2.0919 train_time:444877ms step_avg:69.51ms
+step:6600/20000 train_loss:2.0824 train_time:455307ms step_avg:68.99ms
+step:6800/20000 train_loss:2.1572 train_time:472340ms step_avg:69.46ms
+step:7000/20000 train_loss:2.1331 train_time:488662ms step_avg:69.81ms
+step:7000/20000 val_loss:2.0582 val_bpb:1.2190 train_time:488692ms step_avg:69.81ms
+step:7200/20000 train_loss:2.0539 train_time:503944ms step_avg:69.99ms
+step:7400/20000 train_loss:2.0565 train_time:520195ms step_avg:70.30ms
+step:7600/20000 train_loss:2.0145 train_time:530612ms step_avg:69.82ms
+step:7800/20000 train_loss:2.0521 train_time:546496ms step_avg:70.06ms
+step:8000/20000 train_loss:2.1062 train_time:562870ms step_avg:70.36ms
+step:8000/20000 val_loss:2.0335 val_bpb:1.2043 train_time:562900ms step_avg:70.36ms
+step:8200/20000 train_loss:2.1051 train_time:578448ms step_avg:70.54ms
+step:8400/20000 train_loss:1.9911 train_time:594270ms step_avg:70.75ms
+step:8508/20000 val_loss:2.0255 val_bpb:1.1996 train_time:599920ms step_avg:70.51ms
+stopping_early: wallclock_cap train_time:599920ms step:8508/20000
+peak memory allocated: 7748 MiB reserved: 8066 MiB
+Serialized model: 67224983 bytes
+Code size: 47759 bytes
+Total submission size: 67272742 bytes
+Serialized model int8+zlib: 15839491 bytes (payload:17178912 raw_torch:17224025 payload_ratio:3.91x)
+Total submission size int8+zlib: 15887250 bytes
+final_int8_zlib_roundtrip val_loss:2.0315 val_bpb:1.2032 eval_time:2098ms
+final_int8_zlib_roundtrip_exact val_loss:2.03154449 val_bpb:1.20319508
