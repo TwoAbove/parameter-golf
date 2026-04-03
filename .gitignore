@@ -8,6 +8,14 @@ data/datasets
 data/manifest.json
 data/docs_selected.jsonl
 data/docs_selected.source_manifest.json
+data/embeddings_cache/
 .mypy_cache/
 .venv
 logs/
+models/
+
+# Local experiment files
+*.local.*
+local/
+*.pt
+*.ptz

@@ -73,6 +73,9 @@ class Hyperparameters:
     use_skip_stack = bool(int(os.environ.get("USE_SKIP_STACK", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
+    use_adaln = bool(int(os.environ.get("USE_ADALN", "0")))
+    bounded_resid_mix = bool(int(os.environ.get("BOUNDED_RESID_MIX", "0")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -89,6 +92,34 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Data ordering: "none" (default sequential), "homo" (similar together), "hetero" (diverse together)
+    data_order = os.environ.get("DATA_ORDER", "none")
+    # NoProp: detach between layers, local losses, no backprop through depth
+    noprop = bool(int(os.environ.get("NOPROP", "0")))
+    # Perturbation-based forward-only optimization (no backward at all)
+    perturb = bool(int(os.environ.get("PERTURB", "0")))
+    perturb_eps = float(os.environ.get("PERTURB_EPS", "0.01"))
+    perturb_samples = int(os.environ.get("PERTURB_SAMPLES", "1"))
+    # Focal loss: gamma > 0 upweights hard sequences. 0 = standard mean. Try 1.0-2.0.
+    focal_gamma = float(os.environ.get("FOCAL_GAMMA", "0.0"))
+    # Batch ramp: start at fraction of TRAIN_BATCH_TOKENS, ramp to full over first N% of training
+    batch_ramp_start = float(os.environ.get("BATCH_RAMP_START", "1.0"))  # 1.0 = no ramp, 0.25 = start at 25%
+    batch_ramp_frac = float(os.environ.get("BATCH_RAMP_FRAC", "0.0"))   # fraction of training to ramp over
+    # LR warmup + optional peak overshoot before settling to 1.0x
+    lr_warmup_frac = float(os.environ.get("LR_WARMUP_FRAC", "0.0"))     # 0.05 = warmup over first 5%
+    lr_peak = float(os.environ.get("LR_PEAK", "1.0"))                   # 1.5 = overshoot to 150% then decay to 100%
+    # SNR-adaptive LR: dynamically scale LR based on loss signal-to-noise ratio
+    lr_adapt = bool(int(os.environ.get("LR_ADAPT", "0")))
+    lr_adapt_min = float(os.environ.get("LR_ADAPT_MIN", "0.5"))         # min LR multiplier
+    lr_adapt_max = float(os.environ.get("LR_ADAPT_MAX", "3.0"))         # max LR multiplier
+    lr_adapt_rate = float(os.environ.get("LR_ADAPT_RATE", "0.02"))      # adaptation speed
+    # Model-loss shard reranking: score sequences by model loss, train hardest first
+    loss_rerank = bool(int(os.environ.get("LOSS_RERANK", "0")))
+    # Bigram difficulty tracking: maintain running bigram loss table
+    bigram_difficulty = bool(int(os.environ.get("BIGRAM_DIFFICULTY", "0")))
+    # Drop easiest fraction of sequences per shard (requires a difficulty_fn). 0.0 = keep all.
+    drop_easy = float(os.environ.get("DROP_EASY", "0.0"))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -298,7 +329,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,layer_emb",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,resid_gate,q_gain,skip_weight,skip_weights,layer_emb,adaln_",
     ).split(",")
     if pattern
 )
@@ -455,17 +486,95 @@ def load_data_shard(file: Path) -> Tensor:
 class TokenStream:
     # Reads shards sequentially and wraps around forever. The training loop therefore
     # has deterministic, simple streaming behavior with no sampling or workers.
-    def __init__(self, pattern: str):
+    def __init__(self, pattern: str, order: str = "none", seq_len: int = 1024,
+                 difficulty_fn: callable | None = None, drop_easy: float = 0.0):
         self.files = [Path(p) for p in sorted(glob.glob(pattern))]
         if not self.files:
             raise FileNotFoundError(f"No files found for pattern: {pattern}")
+        self.order = order
+        self.seq_len = seq_len
+        self.drop_easy = drop_easy
+        self.difficulty_fn = difficulty_fn  # optional: (seqs_tensor) -> scores, higher = harder
+        self._pc_lookup: np.ndarray | None = None  # per-token PCA score lookup, fitted from first shard
         self.file_idx = 0
         self.tokens = load_data_shard(self.files[0])
+        if self.order != "none":
+            self.tokens = self._reorder(self.tokens, self.drop_easy)
         self.pos = 0
+
+    def _fit_bow_pca(self, seqs: np.ndarray) -> None:
+        """Fit BoW PCA-1D direction from a subsample. Stores a per-token lookup table."""
+        vocab_size = int(seqs.max()) + 1
+        n, sl = seqs.shape
+        # Build BoW for a subsample (SVD only needs ~10K rows)
+        rng = np.random.default_rng(42)
+        sub_n = min(10_000, n)
+        sub_seqs = seqs[rng.choice(n, sub_n, replace=False)]
+        bow = np.zeros((sub_n, vocab_size), dtype=np.float32)
+        for i in range(sub_n):
+            bow[i] = np.bincount(sub_seqs[i], minlength=vocab_size).astype(np.float32)
+        mean = bow.mean(axis=0)
+        _, _, Vt = np.linalg.svd(bow - mean, full_matrices=False)
+        # Store per-token PC lookup: score = pc_lookup[tokens].sum(axis=1)
+        # Since score = (bow - mean) @ Vt[0] = bow @ Vt[0] - const, and
+        # bow @ Vt[0] = sum(Vt[0][token] for token in seq), the ranking is
+        # determined entirely by Vt[0][tokens].sum() — the mean offset is constant.
+        self._pc_lookup = Vt[0].astype(np.float32)  # (vocab_size,)
+
+    def _reorder(self, tokens: Tensor, drop_easy: float = 0.0) -> Tensor:
+        """Reorder sequences within a shard by difficulty or BoW PCA-1D score."""
+        sl = self.seq_len
+        n_full = tokens.numel() // sl
+        if n_full < 2:
+            return tokens
+        flat = tokens[:n_full * sl].numpy().astype(np.uint16)
+        seqs = flat.reshape(n_full, sl)
+        leftover = tokens[n_full * sl:]
+
+        # Score sequences: prefer difficulty_fn (model loss or bigram), fall back to BoW PCA
+        if self.difficulty_fn is not None:
+            seqs_tensor = torch.from_numpy(seqs.astype(np.int64))
+            scores = self.difficulty_fn(seqs_tensor)
+            if isinstance(scores, Tensor):
+                scores = scores.numpy()
+        else:
+            if self._pc_lookup is None:
+                self._fit_bow_pca(seqs)
+            scores = self._pc_lookup[seqs].sum(axis=1)
+
+        # Sort by score (ascending = easiest first)
+        sorted_idx = np.argsort(scores)
+
+        # Drop easiest fraction
+        if drop_easy > 0.0 and self.difficulty_fn is not None:
+            n_drop = int(n_full * drop_easy)
+            sorted_idx = sorted_idx[n_drop:]  # drop the lowest-scoring (easiest)
+            n_full = len(sorted_idx)
+
+        # Reorder remaining sequences
+        if self.order == "homo":
+            order = sorted_idx
+        elif self.order == "hetero":
+            n_even = (n_full + 1) // 2  # ceil
+            n_odd = n_full // 2         # floor
+            order = np.empty(n_full, dtype=np.int64)
+            order[0::2] = sorted_idx[:n_even]
+            order[1::2] = sorted_idx[n_full - 1 : n_full - 1 - n_odd : -1]
+        elif self.order == "hard_first":
+            order = sorted_idx[::-1].copy()
+        else:
+            return tokens
+
+        reordered = torch.from_numpy(seqs[order].reshape(-1).copy())
+        if leftover.numel() > 0:
+            reordered = torch.cat([reordered, leftover])
+        return reordered
 
     def _advance_file(self) -> None:
         self.file_idx = (self.file_idx + 1) % len(self.files)
         self.tokens = load_data_shard(self.files[self.file_idx])
+        if self.order != "none":
+            self.tokens = self._reorder(self.tokens, self.drop_easy)
         self.pos = 0
 
     def take(self, n: int) -> Tensor:
@@ -486,11 +595,14 @@ class TokenStream:
 class DistributedTokenLoader:
     # Each call consumes a contiguous chunk from the shared token stream, then slices out
     # one disjoint span per rank. The extra "+1" token lets us build (x, y) by shifting.
-    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device):
+    def __init__(self, pattern: str, rank: int, world_size: int, device: torch.device,
+                 order: str = "none", seq_len: int = 1024, difficulty_fn: callable | None = None,
+                 drop_easy: float = 0.0):
         self.rank = rank
         self.world_size = world_size
         self.device = device
-        self.stream = TokenStream(pattern)
+        self.stream = TokenStream(pattern, order=order, seq_len=seq_len, difficulty_fn=difficulty_fn,
+                                  drop_easy=drop_easy)
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
@@ -626,6 +738,19 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SwiGLUMLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: float):
+        super().__init__()
+        hidden = max(1, int(round(mlp_mult * dim)))
+        self.gate = CastedLinear(dim, hidden, bias=False)
+        self.up = CastedLinear(dim, hidden, bias=False)
+        self.down = CastedLinear(hidden, dim, bias=False)
+        self.down._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -636,25 +761,54 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_local_mlp: bool,
+        bounded_resid_mix: bool = False,
+        scale_init: float = 1.0,
+        use_swiglu: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult) if use_local_mlp else None
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        if use_local_mlp:
+            self.mlp = SwiGLUMLP(dim, mlp_mult) if use_swiglu else MLP(dim, mlp_mult)
+        else:
+            self.mlp = None
+        self.attn_scale = nn.Parameter(torch.full((dim,), scale_init, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), scale_init, dtype=torch.float32))
+        self.bounded_resid_mix = bounded_resid_mix
+        if bounded_resid_mix:
+            self.resid_gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        else:
+            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor, shared_mlp: MLP | None = None) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+    def forward(
+        self,
+        x: Tensor,
+        x0: Tensor,
+        shared_mlp: nn.Module | None = None,
+        adaln_attn: tuple[Tensor, Tensor] | None = None,
+        adaln_mlp: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor:
+        if self.bounded_resid_mix:
+            gate = torch.sigmoid(self.resid_gate.to(dtype=x.dtype))
+            x = x + gate[None, None, :] * x0
+        else:
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        h = self.attn_norm(x)
+        if adaln_attn is not None:
+            scale, shift = adaln_attn
+            h = h * (1 + scale[None, None, :]) + shift[None, None, :]
+        attn_out = self.attn(h)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         mlp = self.mlp if self.mlp is not None else shared_mlp
         if mlp is None:
             raise RuntimeError("block requires either a local MLP or shared_mlp")
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp(self.mlp_norm(x))
+        h = self.mlp_norm(x)
+        if adaln_mlp is not None:
+            scale, shift = adaln_mlp
+            h = h * (1 + scale[None, None, :]) + shift[None, None, :]
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp(h)
         return x
 
 
@@ -675,6 +829,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        use_swiglu: bool = False,
+        use_adaln: bool = False,
+        bounded_resid_mix: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -691,18 +848,36 @@ class GPT(nn.Module):
         self.depth_repeats = depth_repeats
         self.share_mlp = share_mlp
         self.use_skip_stack = use_skip_stack
+        self.use_adaln = use_adaln
         self.logical_layers = num_layers * depth_repeats
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2 if use_skip_stack else 0
         self.num_decoder_layers = num_layers - self.num_encoder_layers if use_skip_stack else 0
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        if not self.use_skip_stack and self.depth_repeats > 1:
+        # AdaLN conditioning replaces layer_emb for depth-repeated models.
+        # Scales init with slight negative ramp on later layers — prior toward dampening
+        # on repeated passes rather than amplifying.
+        if use_adaln and depth_repeats > 1:
+            self.register_parameter("layer_emb", None)
+            adaln_scale_init = torch.zeros(self.logical_layers, model_dim, dtype=torch.float32)
+            for i in range(self.logical_layers):
+                adaln_scale_init[i] = -0.02 * (i / max(self.logical_layers - 1, 1))
+            self.adaln_attn_scale = nn.Parameter(adaln_scale_init.clone())
+            self.adaln_attn_shift = nn.Parameter(torch.zeros(self.logical_layers, model_dim, dtype=torch.float32))
+            self.adaln_mlp_scale = nn.Parameter(adaln_scale_init.clone())
+            self.adaln_mlp_shift = nn.Parameter(torch.zeros(self.logical_layers, model_dim, dtype=torch.float32))
+        elif not use_skip_stack and depth_repeats > 1:
             self.layer_emb = nn.Parameter(torch.zeros(self.logical_layers, model_dim, dtype=torch.float32))
             nn.init.normal_(self.layer_emb, std=0.02)
+            self.adaln_attn_scale = None
         else:
             self.register_parameter("layer_emb", None)
-        self.shared_mlp = MLP(model_dim, mlp_mult) if share_mlp else None
+            self.adaln_attn_scale = None
+        # Scale init: 1/sqrt(logical_layers) for tied-depth, 1.0 for baseline
+        scale_init = 1.0 / math.sqrt(self.logical_layers) if depth_repeats > 1 else 1.0
+        MLPClass = SwiGLUMLP if use_swiglu else MLP
+        self.shared_mlp = MLPClass(model_dim, mlp_mult) if share_mlp else None
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -713,6 +888,9 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     use_local_mlp=not share_mlp,
+                    bounded_resid_mix=bounded_resid_mix,
+                    scale_init=scale_init,
+                    use_swiglu=use_swiglu,
                 )
                 for i in range(num_layers)
             ]
@@ -730,8 +908,15 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _run_block(self, block: Block, x: Tensor, x0: Tensor) -> Tensor:
-        return block(x, x0, shared_mlp=self.shared_mlp)
+    def _run_block(
+        self,
+        block: Block,
+        x: Tensor,
+        x0: Tensor,
+        adaln_attn: tuple[Tensor, Tensor] | None = None,
+        adaln_mlp: tuple[Tensor, Tensor] | None = None,
+    ) -> Tensor:
+        return block(x, x0, shared_mlp=self.shared_mlp, adaln_attn=adaln_attn, adaln_mlp=adaln_mlp)
 
     def _forward_skip_stack(self, x: Tensor, x0: Tensor) -> Tensor:
         skips: list[Tensor] = []
@@ -748,31 +933,116 @@ class GPT(nn.Module):
         layer_idx = 0
         for _ in range(self.depth_repeats):
             for block in self.blocks:
-                if self.layer_emb is not None:
+                adaln_attn = adaln_mlp = None
+                if self.adaln_attn_scale is not None:
+                    adaln_attn = (
+                        self.adaln_attn_scale[layer_idx].to(dtype=x.dtype),
+                        self.adaln_attn_shift[layer_idx].to(dtype=x.dtype),
+                    )
+                    adaln_mlp = (
+                        self.adaln_mlp_scale[layer_idx].to(dtype=x.dtype),
+                        self.adaln_mlp_shift[layer_idx].to(dtype=x.dtype),
+                    )
+                elif self.layer_emb is not None:
                     x = x + self.layer_emb[layer_idx].to(dtype=x.dtype)[None, None, :]
-                x = self._run_block(block, x, x0)
+                x = self._run_block(block, x, x0, adaln_attn=adaln_attn, adaln_mlp=adaln_mlp)
                 layer_idx += 1
         return x
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _compute_loss(self, x: Tensor, targets: Tensor, focal_gamma: float = 0.0) -> Tensor:
+        """Shared logit + loss computation with optional focal weighting."""
+        h = self.final_norm(x).reshape(-1, x.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(h, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(h)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        if focal_gamma <= 0.0:
+            return F.cross_entropy(logits.float(), targets, reduction="mean")
+        # Per-token focal loss: hard tokens (high CE) get upweighted directly
+        per_token = F.cross_entropy(logits.float(), targets, reduction="none")
+        weights = (1.0 - torch.exp(-per_token)).pow(focal_gamma)
+        return (weights * per_token).sum() / weights.sum()
+
+    def _forward_noprop(self, x: Tensor, x0: Tensor, targets: Tensor) -> Tensor:
+        """NoProp-style: detach between layers, sum local losses. No backprop through depth."""
+        total_loss = torch.zeros((), device=x.device)
+        n_losses = 0
+        for block in self.blocks:
+            x = self._run_block(block, x.detach(), x0.detach())
+            total_loss = total_loss + self._compute_loss(x, targets)
+            n_losses += 1
+        return total_loss / n_losses
+
+    @torch.no_grad()
+    def perturb_step(
+        self, input_ids: Tensor, target_ids: Tensor, lr: float, epsilon: float = 0.01,
+        n_samples: int = 1,
+    ) -> float:
+        """Forward-only optimization: Gaussian perturbation per block with local losses.
+        No backward pass. No autograd. Returns average loss for logging."""
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        targets = target_ids.reshape(-1)
+        total_loss = 0.0
+
+        for block in self.blocks:
+            x_in = x.detach()
+            x0_in = x0.detach()
+
+            # Collect block params (only 2D matrix params get perturbation — mirrors Muon)
+            params = [(n, p) for n, p in block.named_parameters() if p.ndim >= 2]
+
+            for _ in range(n_samples):
+                # Generate noise
+                noise = [torch.randn_like(p) for _, p in params]
+
+                # +epsilon perturbation
+                for (_, p), z in zip(params, noise):
+                    p.add_(z, alpha=epsilon)
+                h_plus = self._run_block(block, x_in, x0_in)
+                loss_plus = self._compute_loss(h_plus, targets).item()
+
+                # -2*epsilon (swing to minus)
+                for (_, p), z in zip(params, noise):
+                    p.add_(z, alpha=-2 * epsilon)
+                h_minus = self._run_block(block, x_in, x0_in)
+                loss_minus = self._compute_loss(h_minus, targets).item()
+
+                # Restore to original
+                for (_, p), z in zip(params, noise):
+                    p.add_(z, alpha=epsilon)
+
+                # Update: gradient estimate = (loss+ - loss-) / (2*eps) * noise
+                grad_scale = (loss_plus - loss_minus) / (2 * epsilon * n_samples)
+                for (_, p), z in zip(params, noise):
+                    p.add_(z, alpha=-lr * grad_scale)
+
+            # Forward with updated block for next layer's input
+            x = self._run_block(block, x_in, x0_in)
+            total_loss += self._compute_loss(x, targets).item()
+
+        return total_loss / len(self.blocks)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor, noprop: bool = False,
+                focal_gamma: float = 0.0) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        targets = target_ids.reshape(-1)
+
+        if noprop:
+            return self._forward_noprop(x, x0, targets)
+
         if self.use_skip_stack:
             x = self._forward_skip_stack(x, x0)
         else:
             x = self._forward_repeated_stack(x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return self._compute_loss(x, targets, focal_gamma=focal_gamma)
 
 
 # -----------------------------
@@ -796,9 +1066,12 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if int(os.environ.get("GRAD_ACCUM_STEPS", "0")) > 0:
+        grad_accum_steps = int(os.environ["GRAD_ACCUM_STEPS"])
+    else:
+        if 8 % world_size != 0:
+            raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
+        grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -889,12 +1162,22 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        use_swiglu=args.use_swiglu,
+        use_adaln=args.use_adaln,
+        bounded_resid_mix=args.bounded_resid_mix,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if args.noprop:
+        # NoProp's per-layer detach + local losses can't be traced as a single fullgraph.
+        # Compile each block individually instead.
+        for i, block in enumerate(base_model.blocks):
+            base_model.blocks[i] = torch.compile(block, dynamic=False)
+        compiled_model = base_model
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -919,6 +1202,11 @@ def main() -> None:
         scalar_params.append(base_model.skip_weights)
     if base_model.layer_emb is not None:
         scalar_params.append(base_model.layer_emb)
+    if base_model.adaln_attn_scale is not None:
+        scalar_params.extend([
+            base_model.adaln_attn_scale, base_model.adaln_attn_shift,
+            base_model.adaln_mlp_scale, base_model.adaln_mlp_shift,
+        ])
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -970,13 +1258,47 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
-    log0(f"seed:{args.seed}")
+    log0(f"seed:{args.seed} data_order:{args.data_order} noprop:{args.noprop}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
-    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    # Build difficulty scoring function for adaptive data ordering
+    _difficulty_fn = None
+    if args.loss_rerank:
+        # Model-loss scoring: forward pass over sequences, return per-seq loss (higher = harder)
+        @torch.no_grad()
+        def _model_loss_scorer(seqs: Tensor, _model=base_model, _device=device) -> Tensor:
+            n, sl = seqs.shape
+            scores = torch.zeros(n)
+            batch = 512
+            for i in range(0, n, batch):
+                chunk = seqs[i:i+batch].to(_device)
+                x, y = chunk[:, :-1], chunk[:, 1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits_flat = _model.final_norm(
+                        _model._forward_skip_stack(
+                            F.rms_norm(_model.tok_emb(x), (_model.tok_emb.weight.size(1),)),
+                            F.rms_norm(_model.tok_emb(x), (_model.tok_emb.weight.size(1),)),
+                        )
+                    ).reshape(-1, _model.tok_emb.weight.size(1))
+                    if _model.tie_embeddings:
+                        logits = F.linear(logits_flat, _model.tok_emb.weight)
+                    else:
+                        logits = _model.lm_head(logits_flat)
+                    per_tok = F.cross_entropy(logits.float(), y.reshape(-1), reduction="none")
+                    scores[i:i+chunk.size(0)] = per_tok.reshape(chunk.size(0), -1).mean(dim=1).cpu()
+            return scores
+        _difficulty_fn = _model_loss_scorer
+    elif args.bigram_difficulty:
+        # Will be set after bigram tables are initialized (in the training loop state section)
+        pass  # handled below
+
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device,
+                                          order=args.data_order, seq_len=args.train_seq_len,
+                                          difficulty_fn=_difficulty_fn,
+                                          drop_easy=args.drop_easy)
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -984,7 +1306,48 @@ def main() -> None:
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
+    def training_progress(step: int, elapsed_ms: float) -> float:
+        """Estimate training progress 0→1, using wallclock if capped, else step count."""
+        if max_wallclock_ms is not None:
+            return min(elapsed_ms / max_wallclock_ms, 1.0)
+        return min(step / max(args.iterations, 1), 1.0)
+
+    def batch_tokens_for_step(step: int, elapsed_ms: float) -> int:
+        """Ramp batch from start fraction to full TRAIN_BATCH_TOKENS."""
+        if args.batch_ramp_frac <= 0 or args.batch_ramp_start >= 1.0:
+            return args.train_batch_tokens
+        t = training_progress(step, elapsed_ms)
+        if t >= args.batch_ramp_frac:
+            return args.train_batch_tokens
+        ramp_t = t / args.batch_ramp_frac  # 0→1 within ramp phase
+        frac = args.batch_ramp_start + ramp_t * (1.0 - args.batch_ramp_start)
+        # Round down to multiple of (world_size * seq_len) for clean division
+        raw = int(args.train_batch_tokens * frac)
+        quantum = world_size * args.train_seq_len * grad_accum_steps
+        return max(quantum, (raw // quantum) * quantum)
+
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        t = training_progress(step, elapsed_ms)
+        # Warmup phase: ramp from ~0 to lr_peak
+        if args.lr_warmup_frac > 0 and t < args.lr_warmup_frac:
+            warmup_t = t / args.lr_warmup_frac
+            return warmup_t * args.lr_peak
+        # Peak → 1.0 decay phase (between warmup end and warmdown start)
+        if args.lr_peak > 1.0 and args.lr_warmup_frac > 0:
+            # Linear decay from peak to 1.0 over the region after warmup, before warmdown
+            warmdown_t = 1.0  # when warmdown kicks in
+            if args.warmdown_iters > 0:
+                if max_wallclock_ms is None:
+                    warmdown_t = max(1.0 - args.warmdown_iters / max(args.iterations, 1), 0.0)
+                else:
+                    step_ms = elapsed_ms / max(step, 1)
+                    warmdown_t = max(1.0 - (args.warmdown_iters * step_ms) / max_wallclock_ms, 0.0)
+            mid_end = warmdown_t
+            mid_start = args.lr_warmup_frac
+            if t < mid_end and mid_end > mid_start:
+                decay_t = (t - mid_start) / (mid_end - mid_start)
+                return args.lr_peak + decay_t * (1.0 - args.lr_peak)
+        # Warmdown phase (existing logic)
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
@@ -1021,7 +1384,35 @@ def main() -> None:
         zero_grad_all()
         if distributed:
             model.require_backward_grad_sync = True
-        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device,
+                                                  order=args.data_order, seq_len=args.train_seq_len,
+                                                  difficulty_fn=_difficulty_fn,
+                                          drop_easy=args.drop_easy)
+
+    # -----------------------------
+    # ADAPTIVE LR + DIFFICULTY TRACKING STATE
+    # -----------------------------
+
+    lr_adapt_scale = 1.0
+    loss_ema = 0.0
+    loss_var_ema = 0.0
+    loss_ema_initialized = False
+
+    # Bigram difficulty table: running average of loss per (token_t, token_t+1) pair
+    bigram_loss_table: Tensor | None = None
+    bigram_count_table: Tensor | None = None
+    if args.bigram_difficulty:
+        bigram_loss_table = torch.zeros(args.vocab_size, args.vocab_size, device=device)
+        bigram_count_table = torch.ones(args.vocab_size, args.vocab_size, device=device)  # ones to avoid div-by-zero
+        # Set the difficulty_fn on the stream to use bigram tables
+        def _bigram_scorer(seqs: Tensor, _lt=bigram_loss_table, _ct=bigram_count_table) -> Tensor:
+            # Score = mean bigram difficulty across the sequence
+            avg_table = (_lt / _ct).cpu()  # (V, V)
+            x, y = seqs[:, :-1], seqs[:, 1:]
+            # Gather bigram scores: avg_table[x, y]
+            scores = avg_table[x, y].mean(dim=1)  # (N,)
+            return scores
+        train_loader.stream.difficulty_fn = _bigram_scorer
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1031,6 +1422,12 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+
+    def est_total_steps(step: int, elapsed_ms: float) -> int:
+        """Estimate total steps from wallclock cap and rolling step average."""
+        if max_wallclock_ms is None or step < 1 or elapsed_ms <= 0:
+            return args.iterations
+        return min(args.iterations, int(max_wallclock_ms / (elapsed_ms / step)))
 
     step = 0
     while True:
@@ -1053,7 +1450,7 @@ def main() -> None:
                 is_boundary_token_lut,
             )
             log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                f"step:{step}/~{est_total_steps(step, training_time_ms)} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
             torch.cuda.synchronize()
@@ -1063,38 +1460,81 @@ def main() -> None:
             if stop_after_step is not None and step < args.iterations:
                 log0(
                     f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
-                    f"step:{step}/{args.iterations}"
+                    f"step:{step}/~{est_total_steps(step, training_time_ms)}"
                 )
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        zero_grad_all()
-        train_loss = torch.zeros((), device=device)
-        for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+        step_batch_tokens = batch_tokens_for_step(step, elapsed_ms)
+
+        if args.perturb:
+            # Forward-only perturbation step — no backward, no optimizer
+            x, y = train_loader.next_batch(step_batch_tokens, args.train_seq_len, 1)
+            x, y = x.to(device), y.to(device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
+                perturb_loss = base_model.perturb_step(
+                    x, y, lr=args.matrix_lr * scale, epsilon=args.perturb_eps,
+                    n_samples=args.perturb_samples,
+                )
+            train_loss = torch.tensor(perturb_loss, device=device)
+        else:
+            zero_grad_all()
+            train_loss = torch.zeros((), device=device)
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                x, y = train_loader.next_batch(step_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y, noprop=args.noprop, focal_gamma=args.focal_gamma)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+            train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        # SNR-adaptive LR: adjust lr_adapt_scale based on loss statistics
+        if args.lr_adapt:
+            tl = train_loss.item()
+            if not loss_ema_initialized:
+                loss_ema = tl
+                loss_var_ema = 0.0
+                loss_ema_initialized = True
+            else:
+                prev_ema = loss_ema
+                loss_ema = 0.99 * loss_ema + 0.01 * tl
+                loss_var_ema = 0.99 * loss_var_ema + 0.01 * (tl - loss_ema) ** 2
+                if step > 50:
+                    improvement = prev_ema - loss_ema
+                    noise = max(loss_var_ema ** 0.5, 1e-8)
+                    snr = improvement / noise
+                    # Positive SNR → learning well → increase LR; negative → decrease
+                    lr_adapt_scale *= 1.0 + args.lr_adapt_rate * max(min(snr, 1.0), -1.0)
+                    lr_adapt_scale = max(args.lr_adapt_min, min(args.lr_adapt_max, lr_adapt_scale))
 
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
+        # Update bigram difficulty table: EMA of batch loss per observed bigram
+        if bigram_loss_table is not None and not args.perturb:
+            with torch.no_grad():
+                flat_x = x.reshape(-1)
+                flat_y = y.reshape(-1)
+                tl = train_loss.item()
+                bigram_loss_table[flat_x, flat_y] = 0.99 * bigram_loss_table[flat_x, flat_y] + 0.01 * tl
+                bigram_count_table[flat_x, flat_y] = bigram_count_table[flat_x, flat_y] + 1
 
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
-        zero_grad_all()
+        if not args.perturb:
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
+
+            effective_scale = scale * (lr_adapt_scale if args.lr_adapt else 1.0)
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["base_lr"] * effective_scale
+
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            for opt in optimizers:
+                opt.step()
+            zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1104,7 +1544,7 @@ def main() -> None:
         )
         if should_log_train:
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/~{est_total_steps(step, approx_training_time_ms)} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
@@ -1128,9 +1568,12 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
+    os.makedirs("models", exist_ok=True)
+    model_pt_path = f"models/final_model_{args.run_id}.pt"
+    model_int8_path = f"models/final_model_{args.run_id}.int8.ptz"
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        model_bytes = os.path.getsize("final_model.pt")
+        torch.save(base_model.state_dict(), model_pt_path)
+        model_bytes = os.path.getsize(model_pt_path)
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
@@ -1143,9 +1586,9 @@ def main() -> None:
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(model_int8_path, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(model_int8_path)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
@@ -1156,7 +1599,7 @@ def main() -> None:
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(model_int8_path, "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)

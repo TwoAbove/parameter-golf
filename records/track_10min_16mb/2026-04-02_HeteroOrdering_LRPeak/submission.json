@@ -1,0 +1,45 @@
+{
+  "author": "TwoAbove",
+  "github_id": "TwoAbove",
+  "name": "Heterogeneous Data Ordering + LR Peak on AR Self-Gen GPTQ + XSA stack",
+  "blurb": "Heterogeneous (diverse-together) data ordering via per-token PCA scoring + LR peak overshoot (2x) on the PR #1019 stack. Data ordering reorders training sequences so consecutive batches see maximally diverse content, improving gradient quality at zero parameter/compute cost.",
+  "date": "2026-04-02",
+  "track": "10min_16mb",
+  "val_loss": null,
+  "val_bpb": null,
+  "val_loss_std": null,
+  "val_bpb_std": null,
+  "seeds": [42, 314, 999],
+  "seed_results": {
+    "42": {
+      "val_loss": null,
+      "val_bpb": null,
+      "artifact_bytes": null,
+      "steps": null,
+      "step_avg_ms": null
+    },
+    "314": {
+      "val_loss": null,
+      "val_bpb": null,
+      "artifact_bytes": null,
+      "steps": null,
+      "step_avg_ms": null
+    },
+    "999": {
+      "val_loss": null,
+      "val_bpb": null,
+      "artifact_bytes": null,
+      "steps": null,
+      "step_avg_ms": null
+    }
+  },
+  "comparison_baseline_pr": 1019,
+  "implementation_lineage_pr": 1019,
+  "artifact_bytes_mean": null,
+  "artifact_bytes_max": null,
+  "bytes_total": null,
+  "train_steps_mean": null,
+  "step_avg_ms_mean": null,
+  "hardware": "8xH100 80GB SXM",
+  "technique_summary": "Heterogeneous data ordering (PCA-based) + LR peak 2x + AR self-gen GPTQ + XSA-all + BigramHash 3072x112 + Parallel Muon + LZMA9"
+}
